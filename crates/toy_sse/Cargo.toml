@@ -1,0 +1,12 @@
+[package]
+name = "toy_sse"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes = "0.8.4"
+aes-gcm = "0.10.3"
+hex-literal = "1.1.0"
+hmac = "0.12.1"
+rand = "0.10.0"
+sha2 = "0.10.9"
