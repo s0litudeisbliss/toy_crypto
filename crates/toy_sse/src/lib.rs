@@ -17,13 +17,19 @@ struct InvertedIndex {
     indexes: HashMap<String, Vec<usize>>,
     documents: HashMap<usize, Document>,
 }
+#[derive(Debug, Clone, Default)]
+struct EncryptedCipherText {
+    nonce: [u8; 12],
+    ciphertext: Vec<u8>,
+    associated_data: Vec<u8>,
+}
 /*
 Key = HMAC(Keyword,K1)
 Value = Encrypted List of All document IDs containing keyword
 */
 #[derive(Debug)]
-struct EncryptedInveretedIndex {
-    encrypted_indexes: HashMap<Vec<u8>, Vec<u8>>,
+struct encrypted_inverted_index {
+    encrypted_indexes: HashMap<Vec<u8>, EncryptedCipherText>,
 }
 
 impl InvertedIndex {
@@ -89,9 +95,11 @@ impl SseParams {
     - Compute Encr_w: AES-GCM(iv = random, key = K2, plaintext = doc_ids)
     - Store
 
+
+
      */
-    fn setup_db(&self, index: &InvertedIndex) -> EncryptedInveretedIndex {
-        let mut encrypted_index = EncryptedInveretedIndex {
+    fn setup_db(&self, index: &InvertedIndex) -> encrypted_inverted_index {
+        let mut encrypted_index = encrypted_inverted_index {
             encrypted_indexes: HashMap::new(),
         };
 
@@ -124,17 +132,105 @@ impl SseParams {
                     .as_slice(),
             );
             let associated_data: Vec<u8> = Vec::new();
-            cipher.encrypt_in_place(Nonce::from_slice(&nonce), &associated_data, &mut buffer);
+            cipher
+                .encrypt_in_place(Nonce::from_slice(&nonce), &associated_data, &mut buffer)
+                .expect("Encryption failed");
 
+            let ct = EncryptedCipherText {
+                nonce,
+                ciphertext: buffer,
+                associated_data: associated_data,
+            };
             encrypted_index
                 .encrypted_indexes
-                .insert(token_hash.to_vec(), buffer.to_vec());
+                .insert(token_hash.to_vec(), ct);
         }
 
         encrypted_index
     }
-}
+    /*
+    Query token is HMAC(K1, w)
+    Parameters: K1, K2, Query token
+    - Compute Addr_w: F(K1, w) → HMAC-SHA256(K1, w) (Note that this is the same as the query token which is provided to the server)
+    - Retrieve Encr_w from DB using Addr_w and pass to client for decryption
 
+    */
+
+    fn query_db(
+        &self,
+        encrypted_inverted_index: &encrypted_inverted_index,
+        query_token: &Vec<Vec<u8>>,
+    ) -> Result<EncryptedCipherText, String> {
+        if query_token.is_empty() {
+            return Err("Query token is empty".to_string());
+        }
+
+        let token = &query_token[0];
+        if !encrypted_inverted_index
+            .encrypted_indexes
+            .contains_key(token)
+        {
+            return Err("Query token not found in encrypted index".to_string());
+        }
+
+        encrypted_inverted_index
+            .encrypted_indexes
+            .get(token)
+            .cloned()
+            .ok_or_else(|| "Query token not found in encrypted index".to_string())
+    }
+
+    fn decrypt_result(
+        &self,
+        encrypted_doc_ids: EncryptedCipherText,
+        token: &str,
+    ) -> Result<Vec<u8>, String> {
+        // Derive 32-byte key for AES-256 from k2 using HMAC
+        let mut key_mac =
+            <HmacSha256 as Mac>::new_from_slice(&self.k2).expect("HMAC can take key of any size");
+
+        //Get keywords by tokenizing the query and then use the first token to derive the key for decryption
+        let tokens = tokenize(token);
+        if tokens.is_empty() {
+            return Err("Token is empty".to_string());
+        }
+        key_mac.update(tokens[0].as_bytes());
+        let derived_key = key_mac.finalize().into_bytes();
+
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key));
+
+        let nonce = &encrypted_doc_ids.nonce;
+
+        let mut buffer = encrypted_doc_ids.ciphertext;
+        let associated_data: Vec<u8> = encrypted_doc_ids.associated_data;
+
+        cipher
+            .decrypt_in_place(
+                Nonce::from_slice(&nonce.as_slice()),
+                &associated_data,
+                &mut buffer,
+            )
+            .expect("Decryption failed");
+
+        Ok(buffer)
+    }
+
+    fn gen_query_token(&self, query: &str) -> Result<Vec<Vec<u8>>, String> {
+        let tokens = tokenize(query);
+        let mut res = Vec::<Vec<u8>>::new();
+        if tokens.is_empty() {
+            return Err("Query contains no valid tokens".to_string());
+        } else {
+            for token in tokens {
+                let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.k1)
+                    .expect("HMAC can take key of any size");
+                mac.update(token.as_bytes()); // Use tokenized (lowercase) keyword
+                res.push(mac.finalize().into_bytes().to_vec());
+            }
+        }
+        Ok(res)
+    }
+}
 fn tokenize(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|ch: char| !ch.is_alphanumeric())
@@ -155,7 +251,7 @@ mod tests {
     fn test_tokenize() {
         let text = "Hello world! This is a test.";
         let tokens = tokenize(text);
-        assert_eq!(tokens, vec!["hello", "world!", "this", "is", "a", "test"]);
+        assert_eq!(tokens, vec!["hello", "world", "this", "is", "a", "test"]);
     }
     #[test]
     fn test_tokenize_empty() {
@@ -268,5 +364,40 @@ mod sse_tests {
 
         let encrypted_index = params.setup_db(&index);
         println!("Encrypted index: {:?}", encrypted_index);
+    }
+    #[test]
+    fn test_query_db() {
+        let mut index = InvertedIndex::new();
+        let doc1 = Document {
+            id: 1,
+            content: "Hello world".to_string(),
+        };
+        let doc2 = Document {
+            id: 2,
+            content: "Hello Rust".to_string(),
+        };
+        index.add(doc1);
+        index.add(doc2);
+
+        let mut params = SseParams {
+            k1: [0u8; 16],
+            k2: [0u8; 16],
+        };
+        params.init_params();
+        let encrypted_index = params.setup_db(&index);
+        let query_token = params.gen_query_token("Hello");
+        let encrypted_result = params
+            .query_db(&encrypted_index, &query_token.unwrap())
+            .expect("Query token should exist");
+        println!("Encrypted result: {:?}", encrypted_result);
+        let decrypted_result = params.decrypt_result(encrypted_result, "Hello");
+        println!("Decrypted result: {:?}", decrypted_result);
+        //assert that decrypted result contains the doc ids 1 and 2
+        let doc_ids: Vec<usize> = decrypted_result
+            .unwrap()
+            .chunks_exact(std::mem::size_of::<usize>())
+            .map(|chunk| usize::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(doc_ids, vec![1, 2]);
     }
 }
