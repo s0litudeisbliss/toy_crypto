@@ -395,7 +395,7 @@ mod sse_tests {
         //assert that decrypted result contains the doc ids 1 and 2
         let doc_ids: Vec<usize> = decrypted_result
             .unwrap()
-            .chunks(8)
+            .chunks_exact(std::mem::size_of::<usize>())
             .map(|chunk| usize::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(doc_ids, vec![1, 2]);
