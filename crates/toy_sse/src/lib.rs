@@ -28,7 +28,7 @@ Key = HMAC(Keyword,K1)
 Value = Encrypted List of All document IDs containing keyword
 */
 #[derive(Debug)]
-struct EncryptedInveretedIndex {
+struct encrypted_inverted_index {
     encrypted_indexes: HashMap<Vec<u8>, EncryptedCipherText>,
 }
 
@@ -95,11 +95,11 @@ impl SseParams {
     - Compute Encr_w: AES-GCM(iv = random, key = K2, plaintext = doc_ids)
     - Store
 
-    Schema for Buffer in EncryptedInvertedIndex: [Nonce (12 bytes) | Encrypted DocIDs (variable length)]
+
 
      */
-    fn setup_db(&self, index: &InvertedIndex) -> EncryptedInveretedIndex {
-        let mut encrypted_index = EncryptedInveretedIndex {
+    fn setup_db(&self, index: &InvertedIndex) -> encrypted_inverted_index {
+        let mut encrypted_index = encrypted_inverted_index {
             encrypted_indexes: HashMap::new(),
         };
 
@@ -138,8 +138,8 @@ impl SseParams {
 
             let ct = EncryptedCipherText {
                 nonce,
-                ciphertext: buffer.clone(),
-                associated_data: associated_data.clone(),
+                ciphertext: buffer,
+                associated_data: associated_data,
             };
             encrypted_index
                 .encrypted_indexes
@@ -158,17 +158,21 @@ impl SseParams {
 
     fn query_db(
         &self,
-        EncryptedInveretedIndex: &EncryptedInveretedIndex,
-        query_token: Vec<u8>,
-    ) -> EncryptedCipherText {
-        EncryptedInveretedIndex
+        encrypted_inverted_index: &encrypted_inverted_index,
+        query_token: &[u8],
+    ) -> Result<EncryptedCipherText, String> {
+        encrypted_inverted_index
             .encrypted_indexes
-            .get(&query_token)
+            .get(query_token)
             .cloned()
-            .unwrap_or_default()
+            .ok_or_else(|| "Query token not found in encrypted index".to_string())
     }
 
-    fn decrypt_result(&self, encrypted_doc_ids: EncryptedCipherText, token: &str) -> Vec<u8> {
+    fn decrypt_result(
+        &self,
+        encrypted_doc_ids: EncryptedCipherText,
+        token: &str,
+    ) -> Result<Vec<u8>, String> {
         // Derive 32-byte key for AES-256 from k2 using HMAC
         let mut key_mac =
             <HmacSha256 as Mac>::new_from_slice(&self.k2).expect("HMAC can take key of any size");
@@ -176,19 +180,19 @@ impl SseParams {
         //Get keywords by tokenizing the query and then use the first token to derive the key for decryption
         let tokens = tokenize(token);
         if tokens.is_empty() {
-            panic!("Token is empty");
+            return Err("Token is empty".to_string());
         }
         key_mac.update(tokens[0].as_bytes());
         let derived_key = key_mac.finalize().into_bytes();
 
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key));
-        // Extract Nonce from the beginning of the buffer
+
         let nonce = &encrypted_doc_ids.nonce;
-        //Nonce is first 12 bytes of the buffer and the rest is the encrypted doc ids followed by the associated data
+
         let mut buffer = encrypted_doc_ids.ciphertext;
         let associated_data: Vec<u8> = encrypted_doc_ids.associated_data;
 
-        let result = cipher
+        cipher
             .decrypt_in_place(
                 Nonce::from_slice(&nonce.as_slice()),
                 &associated_data,
@@ -199,15 +203,21 @@ impl SseParams {
         buffer
     }
 
-    fn gen_query_token(&self, query: &str) -> Vec<u8> {
+    fn gen_query_token(&self, query: &str) -> Result<Vec<Vec<u8>>, String> {
         let tokens = tokenize(query);
+        let res = Vec::<Vec<u8>>::new();
         if tokens.is_empty() {
-            return Vec::new();
+            return Err("Query contains no valid tokens".to_string());
+        } else {
+            for token in tokens {
+                let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.k1)
+                    .expect("HMAC can take key of any size");
+                mac.update(tokens[0].as_bytes()); // Use tokenized (lowercase) keyword
+                mac.finalize().into_bytes().to_vec();
+                res.push(mac);
+            }
         }
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(&self.k1).expect("HMAC can take key of any size");
-        mac.update(tokens[0].as_bytes()); // Use tokenized (lowercase) keyword
-        mac.finalize().into_bytes().to_vec()
+        Ok(res)
     }
 }
 fn tokenize(text: &str) -> Vec<String> {
@@ -365,7 +375,9 @@ mod sse_tests {
         params.init_params();
         let encrypted_index = params.setup_db(&index);
         let query_token = params.gen_query_token("Hello");
-        let encrypted_result = params.query_db(&encrypted_index, query_token);
+        let encrypted_result = params
+            .query_db(&encrypted_index, &query_token)
+            .expect("Query token should exist");
         println!("Encrypted result: {:?}", encrypted_result);
         let decrypted_result = params.decrypt_result(encrypted_result, "Hello");
         println!("Decrypted result: {:?}", decrypted_result);
