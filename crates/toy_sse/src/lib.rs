@@ -159,11 +159,23 @@ impl SseParams {
     fn query_db(
         &self,
         encrypted_inverted_index: &encrypted_inverted_index,
-        query_token: &[u8],
+        query_token: &Vec<Vec<u8>>,
     ) -> Result<EncryptedCipherText, String> {
+        if query_token.is_empty() {
+            return Err("Query token is empty".to_string());
+        }
+
+        let token = &query_token[0];
+        if !encrypted_inverted_index
+            .encrypted_indexes
+            .contains_key(token)
+        {
+            return Err("Query token not found in encrypted index".to_string());
+        }
+
         encrypted_inverted_index
             .encrypted_indexes
-            .get(query_token)
+            .get(token)
             .cloned()
             .ok_or_else(|| "Query token not found in encrypted index".to_string())
     }
@@ -200,21 +212,20 @@ impl SseParams {
             )
             .expect("Decryption failed");
 
-        buffer
+        Ok(buffer)
     }
 
     fn gen_query_token(&self, query: &str) -> Result<Vec<Vec<u8>>, String> {
         let tokens = tokenize(query);
-        let res = Vec::<Vec<u8>>::new();
+        let mut res = Vec::<Vec<u8>>::new();
         if tokens.is_empty() {
             return Err("Query contains no valid tokens".to_string());
         } else {
             for token in tokens {
                 let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.k1)
                     .expect("HMAC can take key of any size");
-                mac.update(tokens[0].as_bytes()); // Use tokenized (lowercase) keyword
-                mac.finalize().into_bytes().to_vec();
-                res.push(mac);
+                mac.update(token.as_bytes()); // Use tokenized (lowercase) keyword
+                res.push(mac.finalize().into_bytes().to_vec());
             }
         }
         Ok(res)
@@ -240,7 +251,7 @@ mod tests {
     fn test_tokenize() {
         let text = "Hello world! This is a test.";
         let tokens = tokenize(text);
-        assert_eq!(tokens, vec!["hello", "world!", "this", "is", "a", "test"]);
+        assert_eq!(tokens, vec!["hello", "world", "this", "is", "a", "test"]);
     }
     #[test]
     fn test_tokenize_empty() {
@@ -376,13 +387,14 @@ mod sse_tests {
         let encrypted_index = params.setup_db(&index);
         let query_token = params.gen_query_token("Hello");
         let encrypted_result = params
-            .query_db(&encrypted_index, &query_token)
+            .query_db(&encrypted_index, &query_token.unwrap())
             .expect("Query token should exist");
         println!("Encrypted result: {:?}", encrypted_result);
         let decrypted_result = params.decrypt_result(encrypted_result, "Hello");
         println!("Decrypted result: {:?}", decrypted_result);
         //assert that decrypted result contains the doc ids 1 and 2
         let doc_ids: Vec<usize> = decrypted_result
+            .unwrap()
             .chunks(8)
             .map(|chunk| usize::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
